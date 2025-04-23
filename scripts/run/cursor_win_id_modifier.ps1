@@ -12,6 +12,7 @@ $NC = "`e[0m"
 # Configuration file paths
 $STORAGE_FILE = "${env:APPDATA}\Cursor\User\globalStorage\storage.json"
 $BACKUP_DIR = "${env:APPDATA}\Cursor\User\globalStorage\backups"
+$MACHINE_ID_FILE = "${env:APPDATA}\Cursor\machineid"
 
 # Check administrator privileges
 function Test-Administrator {
@@ -193,14 +194,12 @@ function Get-RandomHex {
 
 # Improved ID generation function
 function New-StandardMachineId {
-    $template = "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx"
-    $result = $template -replace '[xy]', {
-        param($match)
-        $r = [Random]::new().Next(16)
-        $v = if ($match.Value -eq "x") { $r } else { ($r -band 0x3) -bor 0x8 }
-        return $v.ToString("x")
-    }
-    return $result
+    $bytes = New-Object byte[] 32  # 32 bytes will give us 64 hex characters
+    $rng = [System.Security.Cryptography.RNGCryptoServiceProvider]::new()
+    $rng.GetBytes($bytes)
+    $hexString = [System.BitConverter]::ToString($bytes) -replace '-',''
+    $rng.Dispose()
+    return $hexString.ToLower()  # ensure lowercase to match original format
 }
 
 # Generate IDs using new functions
@@ -209,10 +208,12 @@ $UUID = [System.Guid]::NewGuid().ToString()
 # Convert auth0|user_ to hex bytes
 $prefixBytes = [System.Text.Encoding]::UTF8.GetBytes("auth0|user_")
 $prefixHex = -join ($prefixBytes | ForEach-Object { '{0:x2}' -f $_ })
-# Generate 32 bytes (64 hex characters) random part for machineId
-$randomPart = Get-RandomHex -length 32
+# Calculate remaining length needed after prefix
+$remainingLength = 64 - $prefixHex.Length
+# Generate remaining hex characters
+$randomPart = -join ((1..($remainingLength/2)) | ForEach-Object { '{0:x2}' -f (Get-Random -Minimum 0 -Maximum 256) })
 $MACHINE_ID = "$prefixHex$randomPart"
-$SQM_ID = "{$([System.Guid]::NewGuid().ToString().ToUpper())}"
+$SQM_ID = "{" + [System.Guid]::NewGuid().ToString().ToUpper() + "}"
 
 # Add administrator privilege check before Update-MachineGuid
 if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
@@ -304,26 +305,40 @@ try {
             }
         }
         
-        # Update IDs
-        $storageContent.globalState.machineid = $MACHINE_ID
-        $storageContent.globalState.sqmId = $SQM_ID
-        $storageContent.globalState.uuid = $UUID
-        $storageContent.globalState.macMachineId = $MAC_MACHINE_ID
+        # Create new configuration object with existing and new values
+        $newConfig = @{}
+        
+        # Copy existing properties (excluding ALL telemetry values)
+        $storageContent.PSObject.Properties | ForEach-Object {
+            if (-not ($_.Name -eq 'telemetry.machineId' -or 
+                     $_.Name -eq 'telemetry.sqmId' -or 
+                     $_.Name -eq 'telemetry.devDeviceId' -or 
+                     $_.Name -eq 'telemetry.macMachineId')) {
+                $newConfig[$_.Name] = $_.Value
+            }
+        }
+        
+        # Generate new UUID for devDeviceId
+        $UUID = [System.Guid]::NewGuid().ToString()
+        
+        # Add new telemetry values
+        $newConfig['telemetry.machineId'] = $MACHINE_ID
+        $newConfig['telemetry.sqmId'] = $SQM_ID
+        $newConfig['telemetry.devDeviceId'] = $UUID
+        $newConfig['telemetry.macMachineId'] = $MAC_MACHINE_ID
         
         # Save updated configuration
-        $storageContent | ConvertTo-Json -Depth 10 | Set-Content $STORAGE_FILE -Force
+        $newConfig | ConvertTo-Json -Depth 10 | Set-Content $STORAGE_FILE -Force
         Write-Host "${GREEN}[INFO]${NC} Configuration updated successfully"
     } else {
         Write-Host "${YELLOW}[WARNING]${NC} storage.json not found, creating new configuration..."
         
         # Create new configuration object
         $newConfig = @{
-            globalState = @{
-                machineid = $MACHINE_ID
-                sqmId = $SQM_ID
-                uuid = $UUID
-                macMachineId = $MAC_MACHINE_ID
-            }
+            'telemetry.machineId' = $MACHINE_ID
+            'telemetry.sqmId' = $SQM_ID
+            'telemetry.devDeviceId' = $UUID
+            'telemetry.macMachineId' = $MAC_MACHINE_ID
         }
         
         # Save new configuration
@@ -384,6 +399,64 @@ catch {
 $guidUpdateResult = Update-MachineGuid
 if (-not $guidUpdateResult) {
     Write-Host "${YELLOW}[WARNING]${NC} Unable to detect version, continuing anyway..."
+}
+
+# Update Cursor machine ID
+function Update-CursorMachineId {
+    try {
+        # Check if file exists
+        if (Test-Path $MACHINE_ID_FILE) {
+            Write-Host "${GREEN}[INFO]${NC} Current Cursor machine ID file found"
+            
+            # Read current value for logging
+            $originalId = Get-Content $MACHINE_ID_FILE -ErrorAction SilentlyContinue
+            if ($originalId) {
+                Write-Host "${GREEN}[INFO]${NC} Current machine ID value:"
+                Write-Host "    $originalId"
+            }
+
+            # Create backup with timestamp
+            $backupFile = "$BACKUP_DIR\machineid.backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            Copy-Item $MACHINE_ID_FILE $backupFile
+            Write-Host "${GREEN}[INFO]${NC} Machine ID file backed up to: $backupFile"
+        } else {
+            Write-Host "${YELLOW}[WARNING]${NC} Cursor machine ID file not found, will create new"
+            
+            # Ensure the Cursor directory exists
+            $cursorDir = "${env:APPDATA}\Cursor"
+            if (-not (Test-Path $cursorDir)) {
+                New-Item -ItemType Directory -Path $cursorDir -Force | Out-Null
+            }
+        }
+
+        # Generate new UUID in the correct format
+        $newId = [System.Guid]::NewGuid().ToString().ToLower()
+
+        # Save new machine ID
+        $newId | Set-Content -Path $MACHINE_ID_FILE -Force
+        
+        # Verify the update
+        $verifyId = Get-Content $MACHINE_ID_FILE -ErrorAction Stop
+        if ($verifyId -eq $newId) {
+            Write-Host "${GREEN}[INFO]${NC} Machine ID updated successfully:"
+            Write-Host "    $newId"
+            return $true
+        } else {
+            Write-Host "${RED}[ERROR]${NC} Machine ID verification failed"
+            return $false
+        }
+    }
+    catch {
+        Write-Host "${RED}[ERROR]${NC} Failed to update Cursor machine ID: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+Write-Host ""
+Write-Host "${GREEN}[INFO]${NC} Updating Cursor machine ID..."
+$machineIdResult = Update-CursorMachineId
+if (-not $machineIdResult) {
+    Write-Host "${YELLOW}[WARNING]${NC} Unable to update Cursor machine ID, continuing anyway..."
 }
 
 Write-Host ""
