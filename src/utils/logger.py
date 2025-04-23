@@ -30,7 +30,7 @@ def initialize_logger():
 
         def format(self, record):
             if record.levelno == logging.DEBUG:  # Only add prefix for DEBUG level
-                record.msg = f"[Open Source Project: https://github.com/Ryan0204/cursor-auto-icloud] {record.msg}"
+                record.msg = f"[Open Source Project: https://github.com/pateutz1/cursor-auto-icloud] {record.msg}"
             return super().format(record)
 
     # Clear any existing handlers
